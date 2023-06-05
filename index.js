@@ -3,6 +3,7 @@ const app = express();
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 require('dotenv').config()
+const stripe = require('stripe')(process.env.PAYMENT_SECRET_KEY);
 const port = process.env.PORT || 5000;
 
 // middleware
@@ -26,9 +27,9 @@ const verifyJWT = (req, res, next) => {
   })
 }
 
-
+// mongodb
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.swu9d.mongodb.net/?retryWrites=true&w=majority`;
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.0dt9tdk.mongodb.net/?retryWrites=true&w=majority`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
@@ -39,15 +40,30 @@ const client = new MongoClient(uri, {
   }
 });
 
+
+// const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+// const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.swu9d.mongodb.net/?retryWrites=true&w=majority`;
+// // const uri = 'mongodb+srv://bistroBossServer:X7Ll4rE09a9z0LB0@cluster0.swu9d.mongodb.net/?retryWrites=true&w=majority';
+
+// // Create a MongoClient with a MongoClientOptions object to set the Stable API version
+// const client = new MongoClient(uri, {
+//   serverApi: {
+//     version: ServerApiVersion.v1,
+//     strict: true,
+//     deprecationErrors: true,
+//   }
+// });
+
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
     await client.connect();
 
-    const usersCollection = client.db("bistroDb").collection("users");
-    const menuCollection = client.db("bistroDb").collection("menu");
-    const reviewCollection = client.db("bistroDb").collection("reviews");
-    const cartCollection = client.db("bistroDb").collection("carts");
+    const usersCollection = client.db("bistrodb").collection("users");
+    const menuCollection = client.db("bistrodb").collection("menu");
+    const reviewCollection = client.db("bistrodb").collection("reviews");
+    const cartCollection = client.db("bistrodb").collection("carts");
+    const paymentCollection = client.db("bistrodb").collection("payments");
 
     app.post('/jwt', (req, res) => {
       const user = req.body;
@@ -130,6 +146,19 @@ async function run() {
       res.send(result);
     })
 
+    app.post('/menu',async (req, res)=>{
+      const newItem = req.body;
+      const result = await menuCollection.insertOne(newItem);
+      res.send(result);
+    })
+
+    app.delete('/menu/:id',verifyJWT, verifyAdmin, async(req,res)=>{
+      const id = req.params.id;
+      const query = {_id: new ObjectId(id)};
+      const result = await menuCollection.deleteOne(query);
+      res.send(result);
+    })
+
     // review related apis
     app.get('/reviews', async (req, res) => {
       const result = await reviewCollection.find().toArray();
@@ -147,7 +176,7 @@ async function run() {
 
       const decodedEmail = req.decoded.email;
       if (email !== decodedEmail) {
-        return res.status(403).send({ error: true, message: 'porviden access' })
+        return res.status(403).send({ error: true, message: 'forbidden access' })
       }
 
       const query = { email: email };
@@ -166,6 +195,83 @@ async function run() {
       const query = { _id: new ObjectId(id) };
       const result = await cartCollection.deleteOne(query);
       res.send(result);
+    })
+
+    // payment related api
+    app.post('/payments', verifyJWT , async (req,res)=>{
+      const payment = req.body;
+      const inserResult = await paymentCollection.insertOne(payment);
+
+      const query = {_id: {$in: payment.cartItems.map(id => new ObjectId(id))}}
+      const deleteResult = await cartCollection.deleteMany(query);
+      res.send({ inserResult,deleteResult});
+    }) 
+
+    app.get('/admin-stats', verifyJWT, verifyAdmin, async (req,res) =>{
+      const users = await usersCollection.estimatedDocumentCount();
+      const products = await menuCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+
+      // best way to get sum of a field is to used group and sum oparetor 
+      const payments = await paymentCollection.find().toArray();
+      const revenue = payments.reduce( ( sum, payment ) => sum + payment.price, 0);
+
+      res.send({
+        revenue,
+        users,
+        products,
+        orders
+      })
+    })
+
+    app.get('/order-stat', async (req,res) =>{
+      const pipeline = [
+        {
+          $lookup: {
+            from: 'menu',
+            localField: 'menuItems',
+            foreignField: '_id',
+            as: 'menuItemsData'
+          }
+        },
+        {
+          $unwind: '$menuItemsData'
+        },
+        {
+          $group: {
+            _id: '$menuItemsData.category',
+            count: { $sum: 1 },
+            total: { $sum: '$menuItemsData.price' }
+          }
+        },
+        {
+          $project: {
+            category: '$_id',
+            count: 1,
+            total: { $round: ['$total', 2] },
+            _id: 0
+          }
+        }
+      ];
+
+      const result = await paymentCollection.aggregate(pipeline).toArray()
+      res.send(result)
+    })
+
+    // create payment intent
+    app.post('/create-payment-intent', verifyJWT, async(req, res)=>{
+      const {price} = req.body;
+      const amount = parseInt(price*100);
+      console.log(price,amount);
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: 'usd',
+        payment_method_types: ['card']
+      });
+      
+      res.send({
+        clientSecret: paymentIntent.client_secret
+      })
     })
 
     // Send a ping to confirm a successful connection
